@@ -1,292 +1,147 @@
-# dashboard.py  –  two-pane UI
-# • top  : static warehouse map (never changes)
-# • bottom : live Li-DAR map  + heading arrow + A* path  + goal “X”
-# • grey grid every 2 m, numeric ticks every 4 m
-# • manual arrow-key override / auto toggle
-# • full int() casts → no Qt TypeError
+#!/usr/bin/env python3
+# dashboard.py  –  continuous-drive version
+#
+# Hold ↑ ↓ ← →  (or long-press the GUI arrow buttons) to stream
+# F/B/L/R packets at 20 Hz; release to send S.
 
-import sys, json, math, base64, numpy as np
-from PyQt5.QtCore      import Qt, QUrl, QPointF
-from PyQt5.QtGui       import (QPixmap, QImage, QPainter, QBrush,
-                               QPolygonF, QColor)
-from PyQt5.QtWidgets   import (QApplication, QWidget, QLabel, QPushButton,
-                               QVBoxLayout, QHBoxLayout, QGridLayout, QFrame,
-                               QTextEdit, QCheckBox, QLineEdit)
-from PyQt5.QtWebSockets import QWebSocket
-from PyQt5.QtNetwork    import QAbstractSocket                     # ConnectedState
+import sys
+import math
+import socket
+from PyQt5.QtCore    import Qt, QPointF, QTimer
+from PyQt5.QtGui     import QPixmap, QPainter
+from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton,
+                             QVBoxLayout, QHBoxLayout, QCheckBox)
 
-
-# ────────────────────────────────────────────────────────────────
-class Card(QFrame):
-    def __init__(self, title: str):
-        super().__init__()
-        self.setStyleSheet(
-            "QFrame{background:#2b2d3a;border-radius:10px}"
-            "QLabel{color:white}")
-        v = QVBoxLayout(self)
-        t = QLabel(title); t.setStyleSheet("font-size:12px")
-        self.val = QLabel("--"); self.val.setStyleSheet("font-size:19px")
-        v.addWidget(t); v.addWidget(self.val); v.addStretch()
+# ─────────────── configuration ───────────────
+JETSON_IP  = "192.168.8.144"   # adjust to your Jetson IP
+UDP_PORT   = 5005
+TICK_MS    = 50                # 20 Hz command stream
+STEP_PX    = 4                 # movement per tick
+WIN_W, WIN_H = 800, 600
+# ──────────────────────────────────────────────
 
 
-# ────────────────────────────────────────────────────────────────
 class Dashboard(QWidget):
-    # ── init ────────────────────────────────────────────────────
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AMR UI  •  auto-plan  ⇆  manual drive")
-        self.resize(1280, 720)
+        self.setWindowTitle("AMR TELE-OP")
+        self.resize(WIN_W, WIN_H)
         self.setFocusPolicy(Qt.StrongFocus)
 
-        # robot / map state
-        self.res = 0.10                 # metres per cell
-        self.base         = None        # static occupancy grid (numpy)
-        self._static_done = False       # drawn once flag
-        self.prev_pose = self.prev_ts = None
-        self.manual  = False
-        self.goal    = None             # (gx,gy)
-        self.path    = []               # list of way-points
+        # local pose
+        self.x   = WIN_W / 2
+        self.y   = WIN_H / 2
+        self.yaw = 0.0
 
-        # ―― layout ---------------------------------------------------------
-        root = QHBoxLayout(self)
+        # comms
+        self._udp_sock   = None
+        self._udp_target = (JETSON_IP, UDP_PORT)
 
-        # ◤ left column – two stacked map panes
-        maps_col = QVBoxLayout()
-        self.static_lbl = QLabel(); self.static_lbl.setMinimumSize(600, 300)
-        self.static_lbl.setStyleSheet("background:#111")
-        self.live_lbl   = QLabel(); self.live_lbl.setMinimumSize(600, 300)
-        self.live_lbl.setStyleSheet("background:#111")
-        maps_col.addWidget(self.static_lbl); maps_col.addWidget(self.live_lbl)
-        root.addLayout(maps_col, 3)
+        # current drive command: 'f', 'b', 'l', 'r' or None
+        self.drive_cmd = None
 
-        # ◤ right column
-        right = QVBoxLayout(); root.addLayout(right, 2)
+        # UI ──────────────────────────────────────
+        root = QVBoxLayout(self)
 
-        # telemetry cards
-        grid = QGridLayout(); right.addLayout(grid)
-        self.cards = {}
-        for n, (k, t) in enumerate([
-            ("velocity", "Velocity (m/s)"), ("omega",   "Omega (rad/s)"),
-            ("battery",  "Battery (%)"),    ("rpm_l",   "RPM-L"),
-            ("rpm_r",    "RPM-R")]):
-            c = Card(t); self.cards[k] = c.val
-            grid.addWidget(c, n // 2, n % 2)
+        self.view = QLabel()
+        self.view.setMinimumSize(600, 500)
+        self.view.setStyleSheet("background:#000")
+        root.addWidget(self.view)
 
-        # goal entry row
-        goal_row = QHBoxLayout(); right.addLayout(goal_row)
-        goal_row.addWidget(QLabel("Goal X:"))
-        self.goal_x = QLineEdit("18"); self.goal_x.setFixedWidth(60)
-        goal_row.addWidget(self.goal_x)
-        goal_row.addWidget(QLabel("Y:"))
-        self.goal_y = QLineEdit("8");  self.goal_y.setFixedWidth(60)
-        goal_row.addWidget(self.goal_y)
-        set_btn = QPushButton("Set goal"); goal_row.addWidget(set_btn)
-        set_btn.clicked.connect(self._set_goal)
+        self.manual_cb = QCheckBox("Manual arrow-key drive (hold for motion)")
+        self.manual_cb.setChecked(True)
+        root.addWidget(self.manual_cb)
 
-        # manual toggle
-        self.cb = QCheckBox("Manual arrow-key drive")
-        self.cb.stateChanged.connect(self._toggle_mode)
-        right.addWidget(self.cb)
+        row = QHBoxLayout(); root.addLayout(row)
+        for key, txt in [("l", "←"), ("f", "↑"), ("r", "→"),
+                         ("b", "↓"), ("s", "■")]:
+            btn = QPushButton(txt); btn.setFixedSize(48, 48)
+            if key == "s":
+                btn.setStyleSheet("background:red;color:white")
+                btn.clicked.connect(lambda _=False, k=key: self._stop())
+            else:
+                btn.pressed.connect(lambda k=key: self._start(k))
+                btn.released.connect(lambda: self._stop())
+            row.addWidget(btn)
 
-        # log pane
-        right.addWidget(QLabel("Logs:"))
-        self.log = QTextEdit(readOnly=True)
-        self.log.setStyleSheet("background:#101;color:#ccc")
-        right.addWidget(self.log, 1)
+        # periodic timer
+        self.timer = QTimer(self); self.timer.timeout.connect(self._tick)
+        self.timer.start(TICK_MS)
 
-        # arrow / stop buttons (only active in manual)
-        row = QHBoxLayout(); right.addLayout(row)
-        for k, txt in [("l","←"), ("f","↑"), ("r","→"),
-                       ("b","↓"), ("s","■")]:
-            b = QPushButton(txt); b.setFixedSize(48,48)
-            if k == "s": b.setStyleSheet("background:red;color:white")
-            row.addWidget(b); b.clicked.connect(
-                lambda _, kk=k: self._btn(kk))
+        self.setFocus()
+        self._draw_dot()
 
-        # websocket
-        self.ws = QWebSocket()
-        self.ws.textMessageReceived.connect(self._rx)
-        self.ws.open(QUrl("ws://localhost:8765"))
+    # ─────────────── networking ────────────────
+    def _send(self, letter: str):
+        if self._udp_sock is None:
+            self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_sock.sendto(letter.encode(), self._udp_target)
 
-    # ── WebSocket helpers ───────────────────────────────────────
-    def _send(self, obj: dict):
-        if self.ws.state() == QAbstractSocket.ConnectedState:
-            self.ws.sendTextMessage(json.dumps(obj))
+    # ─────────────── driving logic ─────────────
+    def _start(self, k: str):
+        self.drive_cmd = k
+        self._send(k.upper())      # immediate first packet
 
-    def _toggle_mode(self, state: int):
-        self.manual = bool(state)
-        self._send({"type": "mode",
-                    "mode": "manual" if self.manual else "auto"})
+    def _stop(self):
+        if self.drive_cmd is not None:
+            self._send('S')
+            self.drive_cmd = None
 
-    def _set_goal(self):
-        try:
-            gx = float(self.goal_x.text())
-            gy = float(self.goal_y.text())
-        except ValueError:
-            self.log.append("<b>Invalid goal coordinates</b>")
-            return
-        self.goal = (gx, gy)
-        self._send({"type": "goal", "x": gx, "y": gy})
-        if self.manual:                      # flip back to auto
-            self.cb.setChecked(False)        # triggers _toggle_mode
+    def _tick(self):
+        """Called every TICK_MS ms."""
+        if self.drive_cmd:
+            self._send(self.drive_cmd.upper())
+            self._simulate(self.drive_cmd)
 
-    # arrow / stop buttons
-    def _btn(self, k: str):
-        if not self.manual:
-            return
-        v, w = {"f": (0.5, 0),   "b": (-0.5, 0),
-                "l": (0, 1.2),   "r": (0, -1.2),
-                "s": (0, 0)}[k]
-        self._send({"type": "cmd_vel", "v": v, "w": w})
-
-    # arrow-key hold-to-drive
+    # ─────────────── key events ────────────────
     def keyPressEvent(self, e):
-        if not self.manual or e.isAutoRepeat(): return
-        m = {Qt.Key_Up:    (0.5, 0),
-             Qt.Key_Down: (-0.5, 0),
-             Qt.Key_Left:  (0, 1.2),
-             Qt.Key_Right: (0, -1.2)}
-        if e.key() in m:
-            v, w = m[e.key()]
-            self._send({"type": "cmd_vel", "v": v, "w": w})
+        if not (self.manual_cb.isChecked() and not e.isAutoRepeat()):
+            return
+        key_map = {Qt.Key_Up:'f', Qt.Key_Down:'b',
+                   Qt.Key_Left:'l', Qt.Key_Right:'r'}
+        if e.key() in key_map:
+            self._start(key_map[e.key()])
+        elif e.key() in (Qt.Key_Space, Qt.Key_S):
+            self._stop()
 
     def keyReleaseEvent(self, e):
-        if not self.manual or e.isAutoRepeat(): return
-        if e.key() in (Qt.Key_Up, Qt.Key_Down,
-                       Qt.Key_Left, Qt.Key_Right):
-            self._send({"type": "cmd_vel", "v": 0, "w": 0})
-
-    # ── WebSocket RX ────────────────────────────────────────────
-    def _rx(self, txt: str):
-        d = json.loads(txt)
-        if d.get("type") != "telemetry" or "pose" not in d:
+        if not (self.manual_cb.isChecked() and not e.isAutoRepeat()):
             return
+        if e.key() in (Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right):
+            self._stop()
 
-        # path from server (remaining way-points)
-        if "path" in d: self.path = d["path"]
+    # ─────────────── simulation ────────────────
+    def _simulate(self, k: str):
+        if   k == 'f':
+            self.x += STEP_PX * math.cos(self.yaw)
+            self.y += STEP_PX * math.sin(self.yaw)
+        elif k == 'b':
+            self.x -= STEP_PX * math.cos(self.yaw)
+            self.y -= STEP_PX * math.sin(self.yaw)
+        elif k == 'l':
+            self.yaw += 0.05            # smoother rotation
+        elif k == 'r':
+            self.yaw -= 0.05
 
-        pose, ts = d["pose"], d["ts"]
+        self.x = max(10, min(self.view.width()  - 10, self.x))
+        self.y = max(10, min(self.view.height() - 10, self.y))
+        self._draw_dot()
 
-        # cards
-        if self.prev_pose:
-            dt = (ts - self.prev_ts) / 1000
-            dx = pose["x"] - self.prev_pose["x"]
-            dy = pose["y"] - self.prev_pose["y"]
-            v  = math.hypot(dx, dy) / dt
-            dyaw = (pose["yaw"] - self.prev_pose["yaw"] + 180) % 360 - 180
-            w  = math.radians(dyaw) / dt
-            self.cards["velocity"].setText(f"{v:.2f}")
-            self.cards["omega"]   .setText(f"{w:.2f}")
-        self.prev_pose, self.prev_ts = pose, ts
-        self.cards["battery"].setText(f"{d['battery']:.0f}")
-        self.cards["rpm_l"]  .setText(f"{d['enc_rpm'][0]:.0f}")
-        self.cards["rpm_r"]  .setText(f"{d['enc_rpm'][1]:.0f}")
+    def _draw_dot(self):
+        pix = QPixmap(self.view.size()); pix.fill(Qt.black)
+        p = QPainter(pix); p.setPen(Qt.white); p.setBrush(Qt.white)
 
-        # proximity alert
-        closest = min(d["scan"]["ranges"])
-        if closest < 0.25:
-            self.log.append(
-                f'<span style="color:#ff6b6b">ALERT {closest:.2f} m – '
-                'obstacle very close!</span>')
+        centre = QPointF(self.x, self.y)
+        p.drawEllipse(centre, 6, 6)
+        tip = QPointF(self.x + 14*math.cos(self.yaw),
+                      self.y + 14*math.sin(self.yaw))
+        p.drawLine(centre, tip)
 
-        # static grid comes once
-        if self.base is None:
-            g = d["grid"]
-            self.base = np.frombuffer(base64.b64decode(g["data"]), np.uint8
-                       ).reshape((g["h"], g["w"]))
-
-        self._draw(pose, d["scan"])
-
-    # ── drawing helper ──────────────────────────────────────────
-    def _draw(self, pose: dict, scan: dict):
-        img = self.base.copy()
-        a0  = math.radians(scan["angle_min"])
-        inc = math.radians(scan["angle_inc"])
-        for i, r in enumerate(scan["ranges"]):
-            if r >= 10.0: continue
-            ang = a0 + i * inc + math.radians(pose["yaw"])
-            gx  = pose["x"] + r * math.cos(ang)
-            gy  = pose["y"] + r * math.sin(ang)
-            cx, cy = int(gx / self.res), int(gy / self.res)
-            if 0 <= cy < img.shape[0] and 0 <= cx < img.shape[1]:
-                img[cy, cx] = 200                   # grey free-space
-
-        h, w = img.shape
-        qimg = QImage(img.data, w, h, QImage.Format_Grayscale8)
-        pix  = QPixmap.fromImage(qimg).scaled(
-                   self.live_lbl.size(),
-                   Qt.KeepAspectRatio,
-                   Qt.FastTransformation)
-
-        painter = QPainter(pix)
-        sx, sy = pix.width() / w, pix.height() / h
-
-        # grid every 2 m; tick labels every 4 m
-        painter.setPen(QColor(55, 55, 55))
-        step = int(2 / self.res)
-        for cx in range(0, w, step):
-            x_pix = int(cx * sx)
-            painter.drawLine(x_pix, 0, x_pix, pix.height())
-        for cy in range(0, h, step):
-            y_pix = int(cy * sy)
-            painter.drawLine(0, y_pix, pix.width(), y_pix)
-        painter.setPen(Qt.gray)
-        tick = int(4 / self.res)
-        for cx in range(0, w, tick):
-            painter.drawText(int(cx * sx) + 2, 12, str(int(cx * self.res)))
-        for cy in range(0, h, tick):
-            painter.drawText(2, int(cy * sy) - 2, str(int(cy * self.res)))
-
-        # A* path (white poly-line)
-        if self.path and len(self.path) > 1:
-            painter.setPen(Qt.white)
-            for i in range(len(self.path) - 1):
-                x1, y1 = self.path[i]
-                x2, y2 = self.path[i + 1]
-                painter.drawLine(int(x1 / self.res * sx),
-                                 int(y1 / self.res * sy),
-                                 int(x2 / self.res * sx),
-                                 int(y2 / self.res * sy))
-
-        # robot square + heading arrow
-        cx_pix = pose["x"] / self.res * sx
-        cy_pix = pose["y"] / self.res * sy
-        painter.setBrush(QBrush(Qt.white))
-        painter.drawRect(int(cx_pix) - 4, int(cy_pix) - 4, 8, 8)
-
-        yaw_rad = math.radians(pose["yaw"])
-        tip  = QPointF(cx_pix + 12 * math.cos(yaw_rad),
-                       cy_pix + 12 * math.sin(yaw_rad))
-        left = QPointF(cx_pix + 6 * math.cos(yaw_rad + 2.6),
-                       cy_pix + 6 * math.sin(yaw_rad + 2.6))
-        right= QPointF(cx_pix + 6 * math.cos(yaw_rad - 2.6),
-                       cy_pix + 6 * math.sin(yaw_rad - 2.6))
-        painter.drawPolygon(QPolygonF([tip, left, right]))
-
-        # goal mark
-        if self.goal:
-            gx_pix = self.goal[0] / self.res * sx
-            gy_pix = self.goal[1] / self.res * sy
-            painter.drawLine(int(gx_pix - 6), int(gy_pix - 6),
-                             int(gx_pix + 6), int(gy_pix + 6))
-            painter.drawLine(int(gx_pix - 6), int(gy_pix + 6),
-                             int(gx_pix + 6), int(gy_pix - 6))
-
-        painter.end()
-        self.live_lbl.setPixmap(pix)
-
-        # draw static map once (scaled)
-        if not self._static_done:
-            s_img = QImage(self.base.data, w, h, QImage.Format_Grayscale8)
-            s_pix = QPixmap.fromImage(s_img).scaled(
-                        self.static_lbl.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.FastTransformation)
-            self.static_lbl.setPixmap(s_pix)
-            self._static_done = True
+        p.end()
+        self.view.setPixmap(pix)
 
 
-# ── run app ────────────────────────────────────────────────────
+# ─────────────────────────── runner ────────────────────────────
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     Dashboard().show()

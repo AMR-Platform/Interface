@@ -1,3 +1,4 @@
+#main.py
 import sys
 from PyQt5.QtWidgets import QApplication
 from splash_screen import SplashScreen

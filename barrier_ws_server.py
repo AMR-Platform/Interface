@@ -1,5 +1,5 @@
 """
-barrier_ws_server.py – v9-fixed
+barrier_ws_server.py - v9-fixed
 • LiDAR → occupancy (FREE carving, OCC stamping)
 • obstacle inflation before A*  ⇒  path always fits
 • pure-pursuit follower, auto re-plan, manual override
